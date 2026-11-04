@@ -1,0 +1,16 @@
+# ===========================================================================
+# BBS GATEWAY DENYLIST (denylist.txt)
+# ===========================================================================
+# Block incoming connections by exact IP, CIDR subnet, or wildcard prefix.
+# Blank lines and lines starting with '#' or ';' are ignored.
+# Compatible with Mystic BBS DATA/denylist.txt format.
+#
+# Examples:
+#   198.51.100.4          # Single IP block
+#   203.0.113.0/24        # Full subnet CIDR block
+#   192.0.2.*             # Wildcard prefix block
+# ===========================================================================
+
+# Known abusive scanning subnets / cloud scrapers
+198.51.100.14
+203.0.113.0/24

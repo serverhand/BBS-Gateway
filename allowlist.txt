@@ -1,0 +1,17 @@
+# ===========================================================================
+# BBS GATEWAY ALLOWLIST (allowlist.txt)
+# ===========================================================================
+# Exempt trusted IP addresses and subnets from rate-limiting, connection caps,
+# and automatic bans.
+# Compatible with Mystic BBS DATA/allowlist.txt format.
+#
+# Examples:
+#   127.0.0.1             # Localhost
+#   192.168.1.0/24        # Home / Office LAN
+#   10.0.0.0/8            # Private network
+# ===========================================================================
+
+127.0.0.1
+::1
+192.168.0.0/16
+10.0.0.0/8

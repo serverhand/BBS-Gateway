@@ -19,6 +19,8 @@ Designed for Mystic BBS / ANSI-BBS terminal codecs:
 
 from __future__ import annotations
 
+from collections import defaultdict
+import ipaddress
 import argparse
 import asyncio
 from dataclasses import dataclass, field
@@ -186,8 +188,143 @@ class GatewayConfig:
     color_item_bg: int = 0
     color_hilite_fg: int = 15
     color_hilite_bg: int = 1
+    security_enabled: bool = True
+    max_connections_per_ip: int = 2
+    max_total_nodes: int = 32
+    rate_limit_connections: int = 5
+    rate_limit_window: int = 60
+    auto_ban_duration: int = 900
+    denylist_file: str = "denylist.txt"
+    allowlist_file: str = "allowlist.txt"
+    mystic_data_path: str = ""
     bbs_list: List[BBSEntry] = field(default_factory=list)
 
+
+
+class SecurityManager:
+    """
+    Built-in Application Firewall & Rate-Limiting Engine:
+      - IP Allowlist & Denylist (Supports exact IPs, CIDR subnets, and wildcard 192.168.1.*)
+      - Sliding-window connection rate limiting & temporary automatic bans
+      - Max concurrent sessions per IP (anti-node-hogging / dupeip protection)
+      - Total active node capacity enforcement (max total callers)
+      - Anti-SSRF / re-entrancy loop detection
+    """
+
+    def __init__(self) -> None:
+        self.connection_history: Dict[str, List[float]] = defaultdict(list)
+        self.banned_ips: Dict[str, float] = {}  # ip -> unban_timestamp
+        self.active_sessions: Dict[str, int] = defaultdict(int)  # ip -> count
+        self.total_active: int = 0
+        self.lock = asyncio.Lock()
+
+    @staticmethod
+    def _match_ip_in_entries(ip_str: str, entries: List[str]) -> bool:
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return False
+        for raw in entries:
+            entry = raw.strip()
+            if not entry or entry.startswith("#") or entry.startswith(";"):
+                continue
+            if "*" in entry:
+                prefix = entry.split("*")[0]
+                if ip_str.startswith(prefix):
+                    return True
+                continue
+            try:
+                net = ipaddress.ip_network(entry, strict=False)
+                if ip in net:
+                    return True
+            except ValueError:
+                pass
+        return False
+
+    def load_ip_list_file(self, filename: str, cfg: GatewayConfig, cfg_dir: str) -> List[str]:
+        if not filename:
+            return []
+        paths = []
+        if os.path.isabs(filename):
+            paths.append(filename)
+        else:
+            paths.append(os.path.join(cfg_dir, filename))
+            if cfg.mystic_data_path:
+                paths.append(os.path.join(cfg.mystic_data_path, filename))
+
+        entries: List[str] = []
+        for p in paths:
+            if os.path.exists(p):
+                try:
+                    with open(p, "r", encoding="utf-8", errors="replace") as f:
+                        for line in f:
+                            s = line.strip()
+                            if s and not s.startswith("#") and not s.startswith(";"):
+                                entries.append(s)
+                except Exception as exc:
+                    logging.warning("Error reading IP filter list %s: %s", p, exc)
+        return entries
+
+    async def check_connection(self, ip_str: str, cfg: GatewayConfig, cfg_dir: str) -> Tuple[bool, str]:
+        """
+        Evaluate incoming IP against allowlist, denylist, bans, concurrency, and rate limits.
+        Returns (is_allowed, status_code).
+        """
+        if not cfg.security_enabled:
+            return True, "OK"
+
+        now = time.monotonic()
+        async with self.lock:
+            # 1. Allowlist check (bypasses all security throttles)
+            allowlist_entries = self.load_ip_list_file(cfg.allowlist_file, cfg, cfg_dir)
+            if self._match_ip_in_entries(ip_str, allowlist_entries):
+                return True, "ALLOWLIST_BYPASS"
+
+            # 2. Denylist check
+            denylist_entries = self.load_ip_list_file(cfg.denylist_file, cfg, cfg_dir)
+            if self._match_ip_in_entries(ip_str, denylist_entries):
+                return False, "DENYLIST"
+
+            # 3. Active Auto-Ban check
+            if ip_str in self.banned_ips:
+                if now < self.banned_ips[ip_str]:
+                    rem = int(self.banned_ips[ip_str] - now)
+                    return False, f"BANNED:{rem}"
+                else:
+                    del self.banned_ips[ip_str]
+
+            # 4. Total Gateway Capacity (Max Nodes)
+            if self.total_active >= cfg.max_total_nodes:
+                return False, "BUSY"
+
+            # 5. Concurrent Connections per IP
+            if self.active_sessions[ip_str] >= cfg.max_connections_per_ip:
+                return False, "DUPEIP"
+
+            # 6. Rate Limiting (Sliding Window)
+            history = [t for t in self.connection_history[ip_str] if now - t < cfg.rate_limit_window]
+            history.append(now)
+            self.connection_history[ip_str] = history
+            if len(history) > cfg.rate_limit_connections:
+                self.banned_ips[ip_str] = now + cfg.auto_ban_duration
+                return False, f"RATE_LIMIT:{cfg.auto_ban_duration}"
+
+            return True, "OK"
+
+    async def register_connect(self, ip_str: str) -> None:
+        async with self.lock:
+            self.active_sessions[ip_str] += 1
+            self.total_active += 1
+
+    async def register_disconnect(self, ip_str: str) -> None:
+        async with self.lock:
+            if self.active_sessions[ip_str] > 0:
+                self.active_sessions[ip_str] -= 1
+            if self.total_active > 0:
+                self.total_active -= 1
+
+
+GLOBAL_SECURITY = SecurityManager()
 
 def parse_bool(val: str) -> bool:
     return val.strip().upper() in ("TRUE", "YES", "1", "ON")
@@ -226,6 +363,11 @@ def load_gateway_config(cfg_path: str) -> GatewayConfig:
                         "LOCAL" if host in ("127.0.0.1", "localhost") or host.startswith("192.168.") or host.startswith("10.") else "EXTERNAL"
                     )
                     desc = parts[5] if len(parts) >= 6 else ""
+                    if hotkey in ("L", "P", "Q"):
+                        logging.warning(
+                            "BBS entry '%s' is assigned reserved hotkey '%s' (clashes with gateway controls L=Lightbar, P=Ping, Q=Quit)",
+                            name, hotkey
+                        )
                     cfg.bbs_list.append(
                         BBSEntry(
                             hotkey=hotkey,
@@ -288,6 +430,24 @@ def load_gateway_config(cfg_path: str) -> GatewayConfig:
                 cfg.color_hilite_fg = int(val)
             elif key == "COLOR_HILITE_BG":
                 cfg.color_hilite_bg = int(val)
+            elif key == "SECURITY_ENABLED":
+                cfg.security_enabled = parse_bool(val)
+            elif key == "MAX_CONNECTIONS_PER_IP":
+                cfg.max_connections_per_ip = max(1, int(val))
+            elif key == "MAX_TOTAL_NODES":
+                cfg.max_total_nodes = max(1, int(val))
+            elif key == "RATE_LIMIT_CONNECTIONS":
+                cfg.rate_limit_connections = max(1, int(val))
+            elif key == "RATE_LIMIT_WINDOW":
+                cfg.rate_limit_window = max(5, int(val))
+            elif key == "AUTO_BAN_DURATION":
+                cfg.auto_ban_duration = max(10, int(val))
+            elif key == "DENYLIST_FILE":
+                cfg.denylist_file = val
+            elif key == "ALLOWLIST_FILE":
+                cfg.allowlist_file = val
+            elif key == "MYSTIC_DATA_PATH":
+                cfg.mystic_data_path = val
 
     return cfg
 
@@ -344,7 +504,7 @@ class TelnetSession:
         self.cfg_path = cfg_path
         self.is_inbound_ssh = is_inbound_ssh
         self.cfg = load_gateway_config(cfg_path)
-        peer = writer.get_extra_info("peername")
+        peer = writer.get_extra_info("peername") if writer else None
         self.client_ip = peer[0] if peer else "unknown"
         self.client_port = peer[1] if peer else 0
         self.selected_idx = 0
@@ -590,13 +750,22 @@ class TelnetSession:
         await self.send_ansi("".join(out))
 
     async def check_bbs_online(self) -> None:
-        """Perform a quick non-blocking TCP reachability check across listed Telnet & SSH BBS nodes."""
-        for idx, entry in enumerate(self.cfg.bbs_list):
+        """Perform concurrent non-blocking TCP reachability checks across all listed Telnet & SSH nodes in parallel."""
+        async def _probe_entry(idx: int, entry: BBSEntry) -> None:
             _, _, clean_host = entry.parse_target()
+        # Anti-SSRF and Loopback Protection
+        if clean_host in ("127.0.0.1", "localhost", "0.0.0.0") and entry.port in (self.cfg.listen_port, self.cfg.ssh_listen_port):
+            await self.send_ansi("\r\n|12[!] Loopback loop blocked: Gateway cannot proxy to its own listening port.|07\r\n")
+            await self.read_key(timeout=10)
+            return
+        if clean_host == "169.254.169.254":
+            await self.send_ansi("\r\n|12[!] Security policy blocked: Link-local metadata endpoint prohibited.|07\r\n")
+            await self.read_key(timeout=10)
+            return
             t0 = time.monotonic()
             try:
                 fut = asyncio.open_connection(clean_host, entry.port)
-                r, w = await asyncio.wait_for(fut, timeout=2.0)
+                r, w = await asyncio.wait_for(fut, timeout=1.5)
                 ms = int((time.monotonic() - t0) * 1000)
                 w.close()
                 try:
@@ -605,7 +774,11 @@ class TelnetSession:
                     pass
                 self.ping_status[idx] = f"{ms}ms"
             except Exception:
-                self.ping_status[idx] = "OFFLINE"
+                self.ping_status[idx] = "DOWN"
+
+        await asyncio.gather(
+            *[_probe_entry(idx, entry) for idx, entry in enumerate(self.cfg.bbs_list)]
+        )
 
     async def render_full_screen(self, force_lightbar: bool = False) -> None:
         """Render gateway.ans and/or the lightbar interface according to DISPLAY_MODE."""
@@ -847,6 +1020,15 @@ class TelnetSession:
             return
 
         _, _, clean_host = entry.parse_target()
+        # Anti-SSRF and Loopback Protection
+        if clean_host in ("127.0.0.1", "localhost", "0.0.0.0") and entry.port in (self.cfg.listen_port, self.cfg.ssh_listen_port):
+            await self.send_ansi("\r\n|12[!] Loopback loop blocked: Gateway cannot proxy to its own listening port.|07\r\n")
+            await self.read_key(timeout=10)
+            return
+        if clean_host == "169.254.169.254":
+            await self.send_ansi("\r\n|12[!] Security policy blocked: Link-local metadata endpoint prohibited.|07\r\n")
+            await self.read_key(timeout=10)
+            return
         await self.send_ansi(
             f"{ESC}[0m{ESC}[2J{ESC}[1;1H"
             f"|11╔═════════════════════════════════════════════════════════════════════════════╗\r\n"
@@ -1056,8 +1238,37 @@ async def run_gateway_server(
     bind_port = port_override or cfg.listen_port
 
     async def _client_connected(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        session = TelnetSession(reader, writer, cfg_path, is_inbound_ssh=False)
-        await session.run()
+        peer = writer.get_extra_info("peername") if writer else None
+        client_ip = peer[0] if peer else "unknown"
+        cfg_dir = os.path.dirname(os.path.abspath(cfg_path))
+        is_ok, reason = await GLOBAL_SECURITY.check_connection(client_ip, cfg, cfg_dir)
+        if not is_ok:
+            logging.warning("[FIREWALL REJECT] Caller %s rejected: %s", client_ip, reason)
+            try:
+                if reason == "DENYLIST":
+                    writer.write(b"\r\n\x1b[0;1;31;40mAccess Denied: Your IP address is blocked by the gateway firewall.\x1b[0m\r\n")
+                elif reason.startswith("BANNED") or reason.startswith("RATE_LIMIT"):
+                    writer.write(b"\r\n\x1b[0;1;31;40mAccess Denied: Rate limit exceeded. Your IP has been temporarily banned.\x1b[0m\r\n")
+                elif reason == "DUPEIP":
+                    writer.write(f"\r\n\x1b[0;1;31;40mConnection Refused: Only {cfg.max_connections_per_ip} concurrent connection(s) allowed per IP.\x1b[0m\r\n".encode("ascii"))
+                elif reason == "BUSY":
+                    writer.write(f"\r\n\x1b[0;1;31;40mGateway Busy: Maximum caller capacity ({cfg.max_total_nodes} nodes) reached. Please try again later.\x1b[0m\r\n".encode("ascii"))
+                await writer.drain()
+            except Exception:
+                pass
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return
+
+        await GLOBAL_SECURITY.register_connect(client_ip)
+        try:
+            session = TelnetSession(reader, writer, cfg_path, is_inbound_ssh=False)
+            await session.run()
+        finally:
+            await GLOBAL_SECURITY.register_disconnect(client_ip)
 
     try:
         server = await asyncio.start_server(_client_connected, bind_host, bind_port)
